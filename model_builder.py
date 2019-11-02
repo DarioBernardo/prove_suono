@@ -50,7 +50,7 @@ def get_model_structure(input_shape):
     return model
 
 
-def load_model():
+def load_hotword_recognition_model():
     model = get_model_structure(input_shape = (Tx, n_freq))
     opt = Adam(lr=0.0001, beta_1=0.9, beta_2=0.999, decay=0.01)
     model.compile(loss='binary_crossentropy', optimizer=opt, metrics=["accuracy"])

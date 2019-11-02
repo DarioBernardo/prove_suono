@@ -1,19 +1,12 @@
-import numpy as np
-import time
-from pydub import AudioSegment
-import random
-import sys
-import io
-import os
-import glob
-from td_utils import *
-import matplotlib.mlab as mlab
-import matplotlib.pyplot as plt
 import pyaudio
+import wave
+import time
+import numpy as np
 from queue import Queue
-from threading import Thread
-# To generate wav file from np array.
-from scipy.io.wavfile import write
+
+from model_builder import load_hotword_recognition_model
+import matplotlib.mlab as mlab
+
 
 chunk_duration = 0.5 # Each read length in seconds from mic.
 fs = 44100 # sampling rate for mic
@@ -25,8 +18,7 @@ feed_samples = int(fs * feed_duration)
 
 assert feed_duration/chunk_duration == int(feed_duration/chunk_duration)
 
-
-def detect_triggerword_spectrum(x):
+def detect_triggerword_spectrum(model, x):
     """
     Function to predict the location of the trigger word.
 
@@ -41,10 +33,8 @@ def detect_triggerword_spectrum(x):
     x = x.swapaxes(0, 1)
     x = np.expand_dims(x, axis=0)
 
-    # predictions = model.predict(x)
-    # return predictions.reshape(-1)
-    print("Prediction requested!")
-    return "asdas"
+    predictions = model.predict(x)
+    return predictions.reshape(-1)
 
 
 def has_new_triggerword(predictions, chunk_duration, feed_duration, threshold=0.5):
@@ -95,71 +85,129 @@ def get_spectrogram(data):
     return pxx
 
 
-# Queue to communiate between the audio callback and main thread
-q = Queue()
 
-run = True
+class HotWordDetector:
 
-silence_threshold = 100
+    def __init__(self, ding_filename:str = 'ding.wav'):
+        self.model = load_hotword_recognition_model()
+        self.filename = ding_filename
+        self.p = pyaudio.PyAudio()
+        # Queue to communiate between the audio callback and main thread
+        self.q = Queue()
+        self.run = True
+        self.silence_threshold = 150
+        # Run the demo for a timeout seconds
+        self.timeout = time.time() + 0.5 * 60  # 0.5 minutes from now
+        self.data = None
 
-# Run the demo for a timeout seconds
-timeout = time.time() + 0.5 * 60  # 0.5 minutes from now
+    def play_ding(self):
 
-# Data buffer for the input wavform
-data = np.zeros(feed_samples, dtype='int16')
+        # Set chunk size of 1024 samples per data frame
+        chunk = 1024
 
-def get_audio_input_stream(callback):
-    stream = pyaudio.PyAudio().open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=fs,
-        input=True,
-        frames_per_buffer=chunk_samples,
-        input_device_index=0,
-        stream_callback=callback)
-    return stream
+        # Open the sound file
+        wf = wave.open(self.filename, 'rb')
 
+        # Create an interface to PortAudio
 
-def callback(in_data, frame_count, time_info, status):
-    global run, timeout, data, silence_threshold
-    if time.time() > timeout:
-        run = False
+        # Open a .Stream object to write the WAV file to
+        # 'output = True' indicates that the sound will be played rather than recorded
+        stream = self.p.open(format = self.p.get_format_from_width(wf.getsampwidth()),
+                        channels = wf.getnchannels(),
+                        rate = wf.getframerate(),
+                        output = True)
 
-    data0 = np.frombuffer(in_data, dtype='int16')
-    # print(silence_threshold)
-    print(data0.sum())
-    # print(np.abs(data0).mean())
-    if np.abs(data0).mean() < silence_threshold:
-        sys.stdout.write('-')
+        # Read data in chunks
+        temp_data = wf.readframes(chunk)
+
+        print("data read")
+
+        # Play the sound by writing the audio data to the stream
+        while temp_data != '':
+            stream.write(temp_data)
+            temp_data = wf.readframes(chunk)
+            if temp_data == b'':
+                break
+
+        print("played!")
+
+        # Close and terminate the stream
+        stream.close()
+
+    def __callback(self, in_data, frame_count, time_info, status):
+        if time.time() > self.timeout:
+            self.run = False
+
+        data0 = np.frombuffer(in_data, dtype='int16')
+        # print(silence_threshold)
+        # print(data0.sum())
+        # print(np.abs(data0).mean())
+        if np.abs(data0).mean() < self.silence_threshold:
+            # sys.stdout.write('-')
+            print("silence")
+            return (in_data, pyaudio.paContinue)
+        else:
+            # sys.stdout.write('.')
+            print("sound detected")
+        self.data = np.append(self.data, data0)
+        if len(self.data) > feed_samples:
+            self.data = self.data[-feed_samples:]
+            # Process data async by sending a queue.
+            self.q.put(self.data)
         return (in_data, pyaudio.paContinue)
-    else:
-        sys.stdout.write('.')
-    data = np.append(data, data0)
-    if len(data) > feed_samples:
-        data = data[-feed_samples:]
-        # Process data async by sending a queue.
-        q.put(data)
-    return (in_data, pyaudio.paContinue)
+
+    def listen_for_hotword(self, callback):
+
+        stream = self.get_new_audio_input_stream()
+        stream.start_stream()
+
+        try:
+            while self.run:
+                data = self.q.get()
+                spectrum = get_spectrogram(data)
+                preds = detect_triggerword_spectrum(self.model, spectrum)
+                new_trigger = has_new_triggerword(preds, chunk_duration, feed_duration)
+                if new_trigger:
+                    print("activated!")
+                    # sys.stdout.write('1')
+                    stream.stop_stream()
+                    stream.close()
+                    self.play_ding()
+                    callback()
+                    print("restarting")
+                    stream = self.get_new_audio_input_stream()
+                    stream.start_stream()
+                    print("Input stream started")
+
+                # sys.stdout.flush()
+        except (KeyboardInterrupt, SystemExit):
+            stream.stop_stream()
+            stream.close()
+            self.timeout = time.time()
+            self.run = False
+
+        stream.stop_stream()
+        stream.close()
+
+    def get_new_audio_input_stream(self):
+        stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=fs,
+            input=True,
+            frames_per_buffer=chunk_samples,
+            # input_device_index=0,
+            stream_callback=self.__callback)
+        return stream
+
+    def __del__(self):
+        self.p.terminate()
 
 
-stream = get_audio_input_stream(callback)
-stream.start_stream()
+def do_something():
+    print("######### DOING SOMETHING ######")
 
-try:
-    while run:
-        print("Running!")
-        data = q.get()
-        print("Data fetched!")
-        spectrum = get_spectrogram(data)
-        preds = detect_triggerword_spectrum(spectrum)
-        new_trigger = has_new_triggerword(preds, chunk_duration, feed_duration)
-        if new_trigger:
-            sys.stdout.write('1')
-except (KeyboardInterrupt, SystemExit):
-    stream.stop_stream()
-    stream.close()
-    timeout = time.time()
-    run = False
 
-stream.stop_stream()
-stream.close()
+hot_word_detector = HotWordDetector()
+print("Start listening")
+hot_word_detector.listen_for_hotword(do_something)
